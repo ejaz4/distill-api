@@ -24,6 +24,18 @@ AVAILABLE UI COMPONENT TYPES:
 10. profile - Person profiles, company about pages, artist bios, author pages
 11. quote - Inspirational content, key insights, single powerful messages, testimonials
 
+CRITICAL - IMAGE EXTRACTION:
+The input contains both text AND image items. You MUST extract and use images from the input:
+- Look for items with type: "image" and src: "..." in the input array
+- Match images to relevant cards/content by analyzing surrounding text context
+- For cards: Use "banner" field for a small header image strip on each card
+- For cards: Use "image" field for full-size background images (use sparingly for hero cards)
+- For hero components: Always include heroImage if a relevant image exists
+- For gallery: Extract all relevant images
+- For profiles: Include avatar/photo images
+- NEVER leave cards without images if relevant images exist in the input
+- Images make the output visually engaging - prioritize using them!
+
 MULTI-COMPONENT STRATEGY:
 - Combine MULTIPLE component types to create a rich, visually diverse distilled output
 - Components render top to bottom in the order you specify
@@ -44,7 +56,7 @@ QUALITY GUIDELINES:
 - Be concise but comprehensive
 - Preserve accuracy of facts, numbers, and quotes
 - Use markdown in content fields (article, descriptions) where appropriate
-- Include image URLs from the original content when available and relevant
+- ALWAYS include image URLs from the input when available - this is critical for visual appeal
 - Create visual variety - avoid using the same component type multiple times
 - Order components from most engaging to supporting details`;
 
@@ -78,7 +90,9 @@ const specItemSchema = z.object({
 const cardDataSchema = z.object({
   title: z.string(),
   subtitle: z.string().optional(),
-  image: z.string().optional(),
+  image: z.string().optional().describe("Full card image URL for prominent visual cards"),
+  banner: z.string().optional().describe("Small banner image URL from page for cards with a header image strip"),
+  icon: z.string().optional().describe("Icon name (e.g. 'chart', 'users', 'money', 'star') for icon-style cards"),
   rating: z.number().optional(),
   price: z.string().optional(),
   pros: z.array(z.string()).optional(),
