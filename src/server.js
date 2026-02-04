@@ -1,9 +1,12 @@
 import express from "express";
+import cors from "cors";
 import { z } from "zod";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { generateObject } from "ai";
+import { JSDOM } from "jsdom";
 
 const app = express();
+app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
 // ============================================================================
@@ -59,6 +62,95 @@ QUALITY GUIDELINES:
 - ALWAYS include image URLs from the input when available - this is critical for visual appeal
 - Create visual variety - avoid using the same component type multiple times
 - Order components from most engaging to supporting details`;
+
+// ============================================================================
+// URL Content Extraction
+// ============================================================================
+function isLikelyNoiseElement(el) {
+  const tagName = el.tagName?.toLowerCase() || '';
+  if (['script', 'style', 'noscript', 'iframe', 'svg', 'nav', 'footer', 'header', 'aside', 'form', 'button', 'input', 'select', 'textarea'].includes(tagName)) {
+    return true;
+  }
+  const id = (el.id || '').toLowerCase();
+  const className = (el.className || '').toString().toLowerCase();
+  const noiseTokens = ['ad', 'ads', 'advert', 'promo', 'cookie', 'banner', 'subscribe', 'newsletter', 'share', 'social', 'sidebar', 'footer', 'header', 'nav', 'menu', 'popup', 'modal'];
+  return noiseTokens.some(token => id.includes(token) || className.includes(token));
+}
+
+async function extractContentFromUrl(url) {
+  // Fetch the page
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+    },
+  });
+  
+  if (!response.ok) {
+    throw new Error(`Failed to fetch URL: ${response.status} ${response.statusText}`);
+  }
+  
+  const html = await response.text();
+  const dom = new JSDOM(html);
+  const document = dom.window.document;
+  
+  const content = [];
+  
+  // Find main content container
+  const candidates = Array.from(document.querySelectorAll('main, article, [role="main"], #content, .content, .article, .post, .entry-content'));
+  const filtered = candidates.filter(el => !isLikelyNoiseElement(el));
+  
+  let main;
+  if (filtered.length > 0) {
+    main = filtered.reduce((best, el) => 
+      (el.textContent?.length || 0) > (best.textContent?.length || 0) ? el : best
+    );
+  } else {
+    main = document.body;
+  }
+  
+  function extractFromElement(el) {
+    if (!el || isLikelyNoiseElement(el)) return;
+    
+    const tagName = el.tagName?.toLowerCase();
+    
+    if (['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tagName)) {
+      const text = el.textContent?.trim();
+      if (text) content.push({ type: 'text', content: text });
+      return;
+    }
+    
+    if (tagName === 'img') {
+      let src = el.getAttribute('src') || el.getAttribute('data-src');
+      if (src) {
+        // Make relative URLs absolute
+        try {
+          src = new URL(src, url).href;
+        } catch {}
+        content.push({ type: 'image', src });
+      }
+      return;
+    }
+    
+    if (tagName === 'p') {
+      const text = el.textContent?.trim();
+      if (text && text.length > 20) {
+        content.push({ type: 'text', content: text });
+      }
+      return;
+    }
+    
+    // Recurse into children
+    if (el.children) {
+      Array.from(el.children).forEach(extractFromElement);
+    }
+  }
+  
+  extractFromElement(main);
+  
+  return content;
+}
 
 // ============================================================================
 // Validation Schemas
@@ -308,6 +400,8 @@ const buildContentForModel = (items) => {
   return content;
 };
 
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL ?? "google/gemini-2.0-flash-001";
+
 const getOpenRouterModel = (model) => {
   const apiKey = process.env.OPENROUTER_API_KEY ?? "";
   if (!apiKey) {
@@ -316,12 +410,71 @@ const getOpenRouterModel = (model) => {
     throw error;
   }
   const openrouter = createOpenRouter({ apiKey });
-  return openrouter(model);
+  return openrouter(model ?? DEFAULT_MODEL);
 };
 
 // Health check
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+
+// POST route for URL-based distillation (for web app)
+app.post("/api/distill-url", async (req, res) => {
+  // eslint-disable-next-line no-console
+  console.log("/api/distill-url: request received");
+
+  const { url, model } = req.body;
+  
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: "URL is required" });
+  }
+
+  try {
+    // Extract content from URL
+    // eslint-disable-next-line no-console
+    console.log("/api/distill-url: extracting content from", url);
+    const items = await extractContentFromUrl(url);
+    
+    if (items.length === 0) {
+      return res.status(400).json({ error: "No content could be extracted from the page" });
+    }
+    
+    // eslint-disable-next-line no-console
+    console.log("/api/distill-url: extracted", items.length, "items");
+    
+    const contentForModel = buildContentForModel(items);
+    
+    // eslint-disable-next-line no-console
+    console.log("/api/distill-url: generating distilled content");
+    const result = await generateObject({
+      model: getOpenRouterModel(model),
+      mode: "json",
+      schema: distilledResponseSchema,
+      system: DISTILLATION_SYSTEM_PROMPT,
+      prompt: `Analyze the following webpage content and distill it into the most appropriate UI components.
+Select 1-4 component types that best represent this content's structure and information.
+Order components from most engaging to supporting details.
+Include image URLs from the content where relevant.
+
+Content to distill:
+${contentForModel}`,
+    });
+
+    // eslint-disable-next-line no-console
+    console.log("/api/distill-url: generation complete", {
+      components: result.object.components.length,
+      types: result.object.components.map((c) => c.type),
+    });
+
+    return res.json(result.object);
+  } catch (err) {
+    const statusCode = err?.statusCode ?? 500;
+    const message = err instanceof Error ? err.message : "Unknown error";
+    // eslint-disable-next-line no-console
+    console.log("/api/distill-url: error", { statusCode, message });
+    return res.status(statusCode).json({ error: message });
+  }
 });
 
 
@@ -344,7 +497,7 @@ app.post("/api/distill", async (req, res) => {
   // eslint-disable-next-line no-console
   console.log("/api/distill: validation passed", {
     items: items.length,
-    model: model ?? "google/gemini-2.0-flash-001",
+    model: model ?? DEFAULT_MODEL,
   });
 
   const contentForModel = buildContentForModel(items);
@@ -353,7 +506,7 @@ app.post("/api/distill", async (req, res) => {
     // eslint-disable-next-line no-console
     console.log("/api/distill: generating distilled content");
     const result = await generateObject({
-      model: getOpenRouterModel(model ?? "google/gemini-2.0-flash-001"),
+      model: getOpenRouterModel(model),
       mode: "json",
       schema: distilledResponseSchema,
       system: DISTILLATION_SYSTEM_PROMPT,
@@ -404,7 +557,7 @@ app.post("/api/cards", async (req, res) => {
 
   try {
     const result = await generateObject({
-      model: getOpenRouterModel(model ?? "google/gemini-2.0-flash-001"),
+      model: getOpenRouterModel(model),
       mode: "json",
       schema: distilledResponseSchema,
       system: DISTILLATION_SYSTEM_PROMPT,
